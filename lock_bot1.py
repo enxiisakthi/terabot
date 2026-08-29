@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import asyncio
 import logging
 import threading
 import subprocess
@@ -68,6 +69,14 @@ def _self_ping():
         except Exception as e:
             logging.warning(f"Self-ping failed: {e}")
 # =========================================================================
+
+
+async def delete_later(msg, delay=300):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 def load_ndus():
@@ -241,9 +250,11 @@ async def terabox_handler(event):
             path = TB.download(surl, fid, out_name, status=status)
 
             await status_msg.edit(f"📤 **Uploading [{idx}/{len(files)}]** ...")
-            await bot.send_file(
+            sent = await bot.send_file(
                 event.chat_id, path,
-                caption=f"🎬 **TeraBox Video** ({idx}/{len(files)})\n\n📝 {out_name}")
+                caption=f"🎬 **TeraBox Video** ({idx}/{len(files)})\n\n📝 {out_name}"
+                        f"\n\n⏳ 5 நிமிடத்தில் இந்த file auto-delete ஆகும்!")
+            asyncio.create_task(delete_later(sent))
             os.remove(path)
 
         await status_msg.delete()
