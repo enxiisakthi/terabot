@@ -184,7 +184,8 @@ class TeraBox:
             os.remove(ts_path)
             return dest_mp4
         except Exception:
-            return ts_path
+            os.replace(ts_path, dest_mp4)
+            return dest_mp4
 
 
 TB = TeraBox(load_ndus())
