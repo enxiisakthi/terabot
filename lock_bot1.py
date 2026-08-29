@@ -52,6 +52,21 @@ def start_keepalive():
     server = HTTPServer(("0.0.0.0", port), _KeepAlive)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"✅ Keep-alive server started on port {port}")
+
+    threading.Thread(target=_self_ping, daemon=True).start()
+    print("✅ Self-ping started (every 5 min)")
+
+
+SELF_URL = "https://terabot-uuii.onrender.com"
+
+def _self_ping():
+    while True:
+        time.sleep(300)
+        try:
+            requests.get(SELF_URL, timeout=30)
+            logging.info("Self-ping OK")
+        except Exception as e:
+            logging.warning(f"Self-ping failed: {e}")
 # =========================================================================
 
 
