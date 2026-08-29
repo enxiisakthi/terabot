@@ -185,14 +185,18 @@ class TeraBox:
                 if status:
                     status(i + 1, len(segs))
         try:
-            import imageio_ffmpeg
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            import shutil
+            exe = shutil.which("ffmpeg")
+            if not exe:
+                import imageio_ffmpeg
+                exe = imageio_ffmpeg.get_ffmpeg_exe()
             subprocess.run([exe, "-y", "-i", ts_path, "-c", "copy", dest_mp4],
                            check=True, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
             os.remove(ts_path)
             return dest_mp4
-        except Exception:
+        except Exception as e:
+            logging.error(f"ffmpeg conversion failed: {e}")
             os.replace(ts_path, dest_mp4)
             return dest_mp4
 
