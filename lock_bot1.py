@@ -38,7 +38,6 @@ MAX_FILES = int(os.environ.get("MAX_FILES", 10))
 SELF_URL = os.environ.get("SELF_URL", "https://terabot-uuii.onrender.com")
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 300))
 AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
-USER_MSG_DELETE_DELAY = int(os.environ.get("USER_MSG_DELETE_DELAY", 10))
 MAX_BYTES = 2_000_000_000
 
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
@@ -94,7 +93,7 @@ def load_stats():
 def save_stats(stats):
     try:
         with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
+            json.dump(stats, indent=2, fp=f)
     except Exception:
         pass
 
@@ -123,12 +122,78 @@ def human_readable_size(size_bytes):
 # =========================================================================
 
 
-async def delete_later(msg, delay=AUTO_DELETE_SECONDS):
+# =========================================================================
+# AUTO-DELETE + ANIMATED PROGRESS (variant 1: ▰▱ bar, speed/ETA/elapsed)
+# ========================================================================
+async def auto_delete(chat_id, message_ids, delay=AUTO_DELETE_SECONDS):
     await asyncio.sleep(delay)
+    for mid in list(message_ids):
+        try:
+            await bot.delete_messages(chat_id, [mid])
+        except Exception:
+            pass
+
+
+def _fmt_time(sec):
+    sec = max(int(sec), 0)
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+class Progress:
+    def __init__(self, phase, total=0, label=""):
+        self.phase = phase
+        self.total = total
+        self.done = 0
+        self.label = label
+        self.started = time.time()
+        self.finished = False
+
+    def update(self, done, total=None):
+        self.done = done
+        if total:
+            self.total = total
+
+    def snapshot(self):
+        elapsed = max(time.time() - self.started, 0.1)
+        done, total = self.done, self.total
+        pct = min(done * 100 // total, 100) if total else 0
+        speed = done / elapsed
+        eta = (total - done) / speed if total > done and speed > 0 else 0
+        return done, total, pct, speed, eta, elapsed
+
+
+def _bar(pct, full, empty, cells=10):
+    n = round(pct / 100 * cells)
+    return full * n + empty * (cells - n)
+
+
+def render_progress_v1(p):
+    done, total, pct, speed, eta, elapsed = p.snapshot()
+    icon = {"Download": "📥", "Upload": "📤", "Stream": "🎬"}.get(p.phase, "⏳")
+    verb = {"Download": "Downloading", "Upload": "Uploading",
+            "Stream": "Streaming"}.get(p.phase, p.phase)
+    return (f"{icon} **{verb}** {p.label}\n"
+            f"{_bar(pct, '▰', '♱')} **{pct}%**\n"
+            f"💾 {human_readable_size(done)} / {human_readable_size(total)}\n"
+            f"⚡ {speed / 1048576:.1f} MB/s • ⏳ ETA {_fmt_time(eta)} • 🕐 {_fmt_time(elapsed)}")
+
+
+async def progress_editor(msg, prog, render, interval=3.5):
+    last = None
+    while not prog.finished:
+        text = render(prog)
+        if text != last:
+            try:
+                await msg.edit(text)
+            except Exception:
+                pass
+            last = text
+        await asyncio.sleep(interval)
     try:
-        await msg.delete()
+        await msg.edit(render(prog))
     except Exception:
         pass
+# =========================================================================
 
 
 def load_ndus():
@@ -159,10 +224,10 @@ def extract_surl(url: str):
 
 
 # =========================================================================
-# WRAPPER / SHORT-LINK RESOLVER MODULE
+# WRAPPER / HORT-LINK RESOLVER MODULE
 # Handles links like https://teraboxlinke.com/v/... that redirect (via
 # HTTP 30x, meta-refresh or JS) to the real TeraBox share page.
-# =========================================================================
+# ========================================================================
 WRAPPER_DOMAINS = (
     "teraboxlinke.com", "teraboxlink.com", "teraboxdownloader",
     "teraurl.com", "terabox.app/", "cybernewhub.com",
@@ -457,7 +522,7 @@ async def help_handler(event):
         "📖 **Help Guide**\n\n"
         "**How to use:**\n"
         "1️⃣ Send a TeraBox share link (or a shortened wrapper link)\n"
-        "2️⃣ I'll resolve it & download the video via HLS streaming\n"
+        "2️⃣ I'll resolve it & download the video\n"
         "3️⃣ Files are sent directly to this chat\n\n"
         "**Supported domains:**\n"
         "terabox.com, 1024tera.com, teraboxapp, terasharelink, "
@@ -466,8 +531,7 @@ async def help_handler(event):
         "**Limits:**\n"
         f"• Max {MAX_FILES} files per share\n"
         "• Max 2GB per file (Telegram limit)\n"
-        f"• Files auto-delete after {AUTO_DELETE_SECONDS // 60} min\n"
-        f"• Your link message auto-deletes after delivery\n\n"
+        f"• Messages & files auto-delete after {AUTO_DELETE_SECONDS // 60} min\n\n"
         "**Commands:**\n"
         "/start — Welcome message\n"
         "/help — This guide\n"
@@ -504,7 +568,7 @@ async def terabox_handler(event):
     url = event.text.strip()
     link_match = re.search(r"https?://\S+", url)
     if link_match:
-        url = link_match.group(0).rstrip(".,;!?")
+        url = link_match.group(0).rstrip(".,;:!?")
 
     supported = ("terabox", "1024tera", "terashare", "terafile",
                  "nephobox", "teraboxapp", "momerybox", "gibibox",
@@ -530,6 +594,8 @@ async def terabox_handler(event):
                 "It may be expired or unsupported.\n"
                 "Try sending the direct TeraBox link instead."
             )
+            asyncio.create_task(auto_delete(
+                event.chat_id, [event.message.id, status_msg.id]))
             return
         logger.info(f"Wrapper link resolved to: {resolved}")
         url = resolved
@@ -537,12 +603,16 @@ async def terabox_handler(event):
     surl = extract_surl(url)
     if not surl:
         await status_msg.edit("⚠️ Couldn't find a share ID in the link. Please check the URL format.")
+        asyncio.create_task(auto_delete(
+            event.chat_id, [event.message.id, status_msg.id]))
         return
 
     try:
         files = TB.list_files(surl)
         if not files:
             await status_msg.edit("❌ No files found in this share link.")
+            asyncio.create_task(auto_delete(
+                event.chat_id, [event.message.id, status_msg.id]))
             return
 
         total_files = len(files)
@@ -554,11 +624,9 @@ async def terabox_handler(event):
                 f"Sending first {MAX_FILES} files only."
             )
             files = files[:MAX_FILES]
-        else:
-            await status_msg.edit(
-                f"📁 **{total_files} file(s) found** ({human_readable_size(total_size)})\n"
-                f"⏳ Starting download..."
-            )
+
+        loop = asyncio.get_event_loop()
+        sent_ids = []
 
         for idx, (fid, name, size) in enumerate(files, 1):
             out_name = clean_name(name)
@@ -566,77 +634,72 @@ async def terabox_handler(event):
                 out_name += ".mp4"
 
             if size > MAX_BYTES:
-                await event.respond(
+                skip = await event.respond(
                     f"⚠️ **({idx}/{len(files)})** `{out_name}` is "
                     f"**{human_readable_size(size)}** — exceeds 2GB limit. Skipping."
                 )
+                sent_ids.append(skip.id)
                 continue
 
-            await status_msg.edit(
-                f"📥 **Downloading [{idx}/{len(files)}]**\n\n"
-                f"📁 {out_name}\n"
-                f"📦 Size: {human_readable_size(size)}\n"
-                f"🔐 Resolving original file link..."
-            )
+            label = f"**[{idx}/{len(files)}]** `{out_name}`"
+            prog = Progress("Download", size, label)
+            editor = asyncio.create_task(
+                progress_editor(status_msg, prog, render_progress_v1, 3.5))
 
-            def dlink_download(idx=idx, name=out_name, size=size):
-                url = TB.dlink(surl, fid)
-
-                def prog(done, total):
-                    pct = round(done / total * 100) if total else 0
-                    logger.info(f"[{idx}] {name}: {human_readable_size(done)} ({pct}%)")
-
-                TB.download_full(url, out_name, size, status=prog)
+            def dlink_download():
+                u = TB.dlink(surl, fid)
+                TB.download_full(u, out_name, size, status=prog.update)
                 return out_name
 
             try:
-                loop = asyncio.get_event_loop()
                 path = await loop.run_in_executor(None, dlink_download)
             except Exception as e:
                 logger.warning(f"Full-file download failed, HLS fallback: {e}")
-                await status_msg.edit(
-                    f"📥 **Downloading [{idx}/{len(files)}]**\n\n"
-                    f"📁 {out_name}\n"
-                    f"⚠️ Original link unavailable — stream fallback.\n"
-                    f"⏳ Fetching segments..."
-                )
+                prog.finished = True
+                await editor
+                prog = Progress("Stream", 100, label)
+                editor = asyncio.create_task(
+                    progress_editor(status_msg, prog, render_progress_v1, 3.5))
 
-                def status(a, b, idx=idx, name=out_name, size=size):
-                    pct = round(a / b * 100)
-                    logger.info(f"[{idx}] {name}: segment {a}/{b} ({pct}%)")
+                def status(a, b):
+                    prog.update(int(a * 100 / b), 100)
 
-                path = TB.download(surl, fid, out_name, status=status)
+                path = await loop.run_in_executor(
+                    None, lambda: TB.download(surl, fid, out_name, status=status))
+
+            prog.finished = True
+            await editor
 
             actual_size = os.path.getsize(path) if os.path.exists(path) else size
-
-            await status_msg.edit(
-                f"📤 **Uploading [{idx}/{len(files)}]**\n\n"
-                f"📁 {out_name}\n"
-                f"📦 {human_readable_size(actual_size)}"
-            )
+            prog = Progress("Upload", actual_size, label)
+            editor = asyncio.create_task(
+                progress_editor(status_msg, prog, render_progress_v1, 3.5))
 
             sent = await bot.send_file(
                 event.chat_id, path,
                 caption=f"🎬 **TeraBox Video** ({idx}/{len(files)})\n\n"
                         f"📁 {out_name}\n"
                         f"📦 {human_readable_size(actual_size)}\n\n"
-                        f"⏳ Auto-deletes in {AUTO_DELETE_SECONDS // 60} min"
+                        f"⏳ Auto-deletes in {AUTO_DELETE_SECONDS // 60} min",
+                progress_callback=prog.update
             )
-            asyncio.create_task(delete_later(sent))
+            prog.finished = True
+            await editor
+            sent_ids.append(sent.id)
             os.remove(path)
 
             record_delivery(event.sender_id, user_name, out_name, actual_size)
             logger.info(f"Delivered: {out_name} ({human_readable_size(actual_size)})")
 
         await status_msg.edit("✅ **All files delivered successfully!**")
-        asyncio.create_task(delete_later(status_msg, delay=60))
-
-        # Auto-delete the user's original link message
-        asyncio.create_task(delete_later(event.message, delay=USER_MSG_DELETE_DELAY))
+        asyncio.create_task(auto_delete(
+            event.chat_id, [event.message.id, status_msg.id] + sent_ids))
 
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         await status_msg.edit(f"❌ **Error:** {str(e)[:200]}")
+        asyncio.create_task(auto_delete(
+            event.chat_id, [event.message.id, status_msg.id]))
 
 
 # =========================================================================
