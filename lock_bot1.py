@@ -8,6 +8,8 @@ import logging
 import threading
 import subprocess
 import requests
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urljoin
@@ -38,6 +40,8 @@ MAX_FILES = int(os.environ.get("MAX_FILES", 10))
 SELF_URL = os.environ.get("SELF_URL", "https://terabot-uuii.onrender.com")
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 300))
 AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
+DL_WORKERS = int(os.environ.get("DL_WORKERS", 8))
+DL_CHUNK_BYTES = 16 * 1024 * 1024
 MAX_BYTES = 2_000_000_000
 
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
@@ -362,6 +366,10 @@ class TeraBox:
                                "X-Requested-With": "XMLHttpRequest"})
         for dom in (".1024tera.com", ".terabox.com", ".1024terabox.com"):
             self.s.cookies.set("ndus", ndus, domain=dom, path="/")
+        adapter = HTTPAdapter(pool_connections=DL_WORKERS + 2,
+                              pool_maxsize=DL_WORKERS + 2)
+        self.s.mount("https://", adapter)
+        self.s.mount("http://", adapter)
 
     def _jstoken(self, surl: str) -> str:
         html = self.s.get(
@@ -400,7 +408,27 @@ class TeraBox:
 
     def download_full(self, url: str, dest: str, expect_size: int,
                       status=None) -> int:
-        """Stream the original file in 1MB chunks; verify size before accept."""
+        """Multi-connection download; falls back to single stream on failure."""
+        if expect_size:
+            try:
+                return self._download_parallel(url, dest, expect_size, status)
+            except Exception as e:
+                logger.warning(f"Parallel download failed, single-stream retry: {e}")
+                if os.path.exists(dest):
+                    os.remove(dest)
+        return self._download_single(url, dest, expect_size, status)
+
+    @staticmethod
+    def _verify_size(dest, written, expect_size):
+        if expect_size and abs(written - expect_size) > 1024:
+            if os.path.exists(dest):
+                os.remove(dest)
+            raise ValueError(
+                f"Size mismatch: got {human_readable_size(written)}, "
+                f"expected {human_readable_size(expect_size)}.")
+
+    def _download_single(self, url: str, dest: str, expect_size: int,
+                         status=None) -> int:
         written = 0
         r = self.s.get(url, stream=True, timeout=(30, 300))
         r.raise_for_status()
@@ -411,12 +439,56 @@ class TeraBox:
                     written += len(chunk)
                     if status:
                         status(written, expect_size)
-        if expect_size and abs(written - expect_size) > 1024:
-            if os.path.exists(dest):
-                os.remove(dest)
-            raise ValueError(
-                f"Size mismatch: got {human_readable_size(written)}, "
-                f"expected {human_readable_size(expect_size)}.")
+        self._verify_size(dest, written, expect_size)
+        return written
+
+    def _download_parallel(self, url: str, dest: str, total: int,
+                           status=None) -> int:
+        probe = self.s.get(url, headers={"Range": "bytes=0-0"},
+                           stream=True, timeout=(30, 60))
+        try:
+            if probe.status_code != 206:
+                raise ValueError(
+                    f"range requests unsupported (HTTP {probe.status_code})")
+        finally:
+            probe.close()
+
+        with open(dest, "wb") as f:
+            f.truncate(total)
+
+        ranges = [(s, min(s + DL_CHUNK_BYTES, total) - 1)
+                  for s in range(0, total, DL_CHUNK_BYTES)]
+        written = 0
+        lock = threading.Lock()
+
+        def fetch(rng):
+            nonlocal written
+            start, end = rng
+            headers = {"Range": f"bytes={start}-{end}"}
+            for attempt in range(4):
+                try:
+                    r = self.s.get(url, headers=headers, stream=True,
+                                   timeout=(30, 120))
+                    r.raise_for_status()
+                    with open(dest, "r+b") as f:
+                        f.seek(start)
+                        for chunk in r.iter_content(512 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                                with lock:
+                                    written += len(chunk)
+                                    if status:
+                                        status(written, total)
+                    return
+                except Exception:
+                    if attempt == 3:
+                        raise
+                    time.sleep(2 ** attempt)
+
+        with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
+            for _ in ex.map(fetch, ranges):
+                pass
+        self._verify_size(dest, written, total)
         return written
 
     def list_files(self, surl: str):
@@ -685,13 +757,16 @@ async def terabox_handler(event):
             editor = asyncio.create_task(
                 progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
+            with open(path, "rb") as fh:
+                uploaded = await bot.upload_file(
+                    fh, file_name=out_name, part_size_kb=512,
+                    progress_callback=prog.update)
             sent = await bot.send_file(
-                event.chat_id, path,
+                event.chat_id, uploaded,
                 caption=f"🎬 **TeraBox Video** ({idx}/{len(files)})\n\n"
                         f"📁 {out_name}\n"
                         f"📦 {human_readable_size(actual_size)}\n\n"
-                        f"⏳ Auto-deletes in {AUTO_DELETE_SECONDS // 60} min",
-                progress_callback=prog.update
+                        f"⏳ Auto-deletes in {AUTO_DELETE_SECONDS // 60} min"
             )
             prog.finished = True
             await editor
