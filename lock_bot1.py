@@ -37,6 +37,7 @@ MAX_FILES = int(os.environ.get("MAX_FILES", 10))
 SELF_URL = os.environ.get("SELF_URL", "https://terabot-uuii.onrender.com")
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 300))
 AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
+USER_MSG_DELETE_DELAY = int(os.environ.get("USER_MSG_DELETE_DELAY", 10))
 MAX_BYTES = 2_000_000_000
 
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
@@ -301,7 +302,8 @@ async def help_handler(event):
         "**Limits:**\n"
         f"• Max {MAX_FILES} files per share\n"
         "• Max 2GB per file (Telegram limit)\n"
-        f"• Files auto-delete after {AUTO_DELETE_SECONDS // 60} min\n\n"
+        f"• Files auto-delete after {AUTO_DELETE_SECONDS // 60} min\n"
+        f"• Your link message auto-deletes after delivery\n\n"
         "**Commands:**\n"
         "/start — Welcome message\n"
         "/help — This guide\n"
@@ -424,6 +426,9 @@ async def terabox_handler(event):
         await status_msg.edit("✅ **All files delivered successfully!**")
         asyncio.create_task(delete_later(status_msg, delay=60))
 
+        # Auto-delete the user's original link message
+        asyncio.create_task(delete_later(event.message, delay=USER_MSG_DELETE_DELAY))
+
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         await status_msg.edit(f"❌ **Error:** {str(e)[:200]}")
@@ -437,6 +442,7 @@ def main():
     logger.info(f"Max files per share: {MAX_FILES}")
     logger.info(f"Self-ping URL: {SELF_URL}")
     logger.info(f"Auto-delete: {AUTO_DELETE_SECONDS}s")
+    logger.info(f"User msg delete delay: {USER_MSG_DELETE_DELAY}s")
     start_keepalive()
     bot.start(bot_token=BOT_TOKEN)
     logger.info("✅ Bot is running and listening for messages!")
