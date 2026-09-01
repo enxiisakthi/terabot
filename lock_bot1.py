@@ -10,7 +10,7 @@ import subprocess
 import requests
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from telethon import TelegramClient, events
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -157,6 +157,127 @@ def extract_surl(url: str):
     return None
 
 
+# =========================================================================
+# WRAPPER / SHORT-LINK RESOLVER MODULE
+# Handles links like https://teraboxlinke.com/v/... that redirect (via
+# HTTP 30x, meta-refresh or JS) to the real TeraBox share page.
+# =========================================================================
+WRAPPER_DOMAINS = (
+    "teraboxlinke.com", "teraboxlink.com", "teraboxdownloader",
+    "teraurl.com", "terabox.app/", "cybernewhub.com",
+    "t.ly", "bit.ly", "tinyurl.com",
+    "shorturl.at", "cutt.ly", "is.gd", "rb.gy",
+)
+
+TERABOX_HOST_RE = re.compile(
+    r'https?://(?:www\.)?(?:1024tera|1024terabox|terabox|teraboxapp|teraboxlink'
+    r'|terasharelink|teraboxshare|teraboxurl|freeterabox|nephobox|mirrobox'
+    r'|momerybox|gibibox|goaibox|4funbox|terafileshare)[^\s"\'<>]*'
+    r'(?:/s/1[A-Za-z0-9_-]+|surl=1?[A-Za-z0-9_-]+)[^\s"\'<>]*'
+)
+
+
+def is_wrapper_link(url: str) -> bool:
+    u = url.lower()
+    if extract_surl(url):
+        return False
+    return any(d in u for d in WRAPPER_DOMAINS)
+
+
+def _clean_candidate(cand: str, base_url: str) -> str:
+    cand = cand.strip().strip("'\"")
+    cand = cand.replace("\\u002F", "/").replace("&amp;", "&")
+    if not cand.startswith("http"):
+        cand = urljoin(base_url, cand)
+    return cand
+
+
+def _last_path_segment(url: str):
+    from urllib.parse import urlparse
+    segs = [s for s in urlparse(url).path.split("/") if s]
+    return segs[-1] if segs else None
+
+
+def _next_hop_candidates(html: str, current_url: str) -> list:
+    """Extract possible next URLs from a wrapper page's HTML/JS."""
+    cands = []
+    last_seg = _last_path_segment(current_url)
+
+    m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+url=([^"\'>\s]+)',
+                  html, re.I)
+    if m:
+        cands.append(m.group(1))
+
+    for m in re.finditer(
+            r'(?:location\.href\s*=\s*|location\.replace\(|window\.location\s*=\s*)["\']?(https?://[^"\'`)\s;]+)',
+            html, re.I):
+        cands.append(m.group(1))
+
+    # JS template literals: const target = `https://host/v/${linkId}`
+    for m in re.finditer(r'`?(https?://[^"\'`\s]+?\$\{[^}]+\}[^"\'`\s]*?)`?', html):
+        if last_seg:
+            cands.append(re.sub(r'\$\{[^}]+\}', last_seg, m.group(1)))
+
+    # JS string concat: 'https://1024terabox.com/s/' + encodeURIComponent(videoID)
+    for m in re.finditer(
+            r'["\'](https?://[^"\']+?/s/)["\']\s*\+\s*(?:encodeURIComponent\s*\(\s*)?\w+',
+            html, re.I):
+        if last_seg:
+            cands.append(m.group(1) + last_seg)
+
+    m = TERABOX_HOST_RE.search(html)
+    if m:
+        cands.append(m.group(0))
+
+    return cands
+
+
+def _expand_url_sync(url: str):
+    """Follow HTTP redirects and embedded HTML/JS redirects, hop by hop.
+
+    Returns the resolved TeraBox share URL, or None if not found.
+    """
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+
+        current = url
+        for _hop in range(5):
+            resp = session.get(current, allow_redirects=True, timeout=30)
+            final_url = resp.url
+
+            if extract_surl(final_url):
+                logger.info(f"Wrapper resolved via HTTP redirect: {final_url}")
+                return final_url
+
+            html = resp.text or ""
+            for cand in _next_hop_candidates(html, final_url):
+                cand = _clean_candidate(cand, final_url)
+                surl = extract_surl(cand)
+                if surl:
+                    logger.info(f"Wrapper resolved via page JS: {cand}")
+                    return cand
+                if cand != current:
+                    current = cand
+                    break
+            else:
+                logger.warning(f"Wrapper could not be resolved: {url}")
+                return None
+
+        logger.warning(f"Wrapper resolution exceeded max hops: {url}")
+        return None
+    except Exception as e:
+        logger.warning(f"expand_url failed for {url}: {e}")
+        return None
+
+
+async def expand_wrapper_url(url: str):
+    """Async wrapper — runs the blocking resolver in a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _expand_url_sync, url)
+# =========================================================================
+
+
 class TeraBox:
     def __init__(self, ndus: str):
         self.s = requests.Session()
@@ -293,12 +414,13 @@ async def help_handler(event):
     await event.respond(
         "📖 **Help Guide**\n\n"
         "**How to use:**\n"
-        "1️⃣ Send a TeraBox share link\n"
-        "2️⃣ I'll download the video(s) via HLS streaming\n"
+        "1️⃣ Send a TeraBox share link (or a shortened wrapper link)\n"
+        "2️⃣ I'll resolve it & download the video via HLS streaming\n"
         "3️⃣ Files are sent directly to this chat\n\n"
         "**Supported domains:**\n"
         "terabox.com, 1024tera.com, teraboxapp, terasharelink, "
-        "terafile, nephobox, freeterabox & more!\n\n"
+        "terafile, nephobox, freeterabox & more!\n"
+        "Short links like teraboxlinke.com/v/... are auto-resolved.\n\n"
         "**Limits:**\n"
         f"• Max {MAX_FILES} files per share\n"
         "• Max 2GB per file (Telegram limit)\n"
@@ -338,9 +460,14 @@ async def terabox_handler(event):
         return
 
     url = event.text.strip()
+    link_match = re.search(r"https?://\S+", url)
+    if link_match:
+        url = link_match.group(0).rstrip(".,;!?")
+
     supported = ("terabox", "1024tera", "terashare", "terafile",
                  "nephobox", "teraboxapp", "momerybox", "gibibox",
-                 "goaibox", "4funbox", "mirrobox", "teraboxlink")
+                 "goaibox", "4funbox", "mirrobox", "teraboxlink",
+                 "t.ly", "bit.ly", "tinyurl")
     if not any(k in url.lower() for k in supported):
         await event.respond(
             "⚠️ Please send a valid **TeraBox link** only!\n\n"
@@ -348,13 +475,27 @@ async def terabox_handler(event):
         )
         return
 
-    surl = extract_surl(url)
-    if not surl:
-        await event.respond("⚠️ Couldn't find a share ID in the link. Please check the URL format.")
-        return
-
     user_name = event.sender.first_name or "User"
     status_msg = await event.respond("🔄 **Processing your link... Please wait...**")
+
+    # Resolve wrapper / shortened links to the real TeraBox share URL
+    if is_wrapper_link(url):
+        await status_msg.edit("🔗 **Resolving shortened link...**\n\n⏳ Following redirects...")
+        resolved = await expand_wrapper_url(url)
+        if not resolved:
+            await status_msg.edit(
+                "❌ Couldn't resolve this shortened link.\n\n"
+                "It may be expired or unsupported.\n"
+                "Try sending the direct TeraBox link instead."
+            )
+            return
+        logger.info(f"Wrapper link resolved to: {resolved}")
+        url = resolved
+
+    surl = extract_surl(url)
+    if not surl:
+        await status_msg.edit("⚠️ Couldn't find a share ID in the link. Please check the URL format.")
+        return
 
     try:
         files = TB.list_files(surl)
@@ -442,7 +583,6 @@ def main():
     logger.info(f"Max files per share: {MAX_FILES}")
     logger.info(f"Self-ping URL: {SELF_URL}")
     logger.info(f"Auto-delete: {AUTO_DELETE_SECONDS}s")
-    logger.info(f"User msg delete delay: {USER_MSG_DELETE_DELAY}s")
     start_keepalive()
     bot.start(bot_token=BOT_TOKEN)
     logger.info("✅ Bot is running and listening for messages!")
