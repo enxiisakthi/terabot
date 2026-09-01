@@ -123,8 +123,9 @@ def human_readable_size(size_bytes):
 
 
 # =========================================================================
-# AUTO-DELETE + ANIMATED PROGRESS (variant 2: spinner + ■□ bar, completed/total, speed)
-# ========================================================================
+# AUTO-DELETE + DUAL ANIMATED PROGRESS (spinner + emoji + block bar,
+# percentage, speed, ETA, size, elapsed — edits throttled to 3s)
+# =========================================================================
 async def auto_delete(chat_id, user_msg_id, bot_msg_id, delay=AUTO_DELETE_SECONDS):
     await asyncio.sleep(delay)
     ids = [user_msg_id]
@@ -172,18 +173,19 @@ def _bar(pct, full, empty, cells=10):
     return full * n + empty * (cells - n)
 
 
-SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "…", "⠧", "⠇", "⠏")
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
-def render_progress_v2(p):
+def render_progress_dual(p):
     done, total, pct, speed, eta, elapsed = p.snapshot()
     spin = SPINNER_FRAMES[int(elapsed / 0.5) % len(SPINNER_FRAMES)]
     verb = {"Download": "Downloading", "Upload": "Uploading",
             "Stream": "Streaming"}.get(p.phase, p.phase)
-    return (f"{spin} **{verb}** {p.label}\n"
-            f"{_bar(pct, '■', '□')} **{pct}%**\n"
-            f"💾 {human_readable_size(done)} / {human_readable_size(total)}\n"
-            f"⚡ {speed / 1048576:.1f} MB/s")
+    return (f"{spin} 🌀 **{verb}...** [{_bar(pct, '▰', '▱')}] **{pct}%**\n"
+            f"{p.label}\n"
+            f"⚡ Speed: {speed / 1048576:.1f} MB/s | ⏳ ETA: {_fmt_time(eta)}\n"
+            f"📦 Size: {human_readable_size(done)} / {human_readable_size(total)}\n"
+            f"🕐 Elapsed: {_fmt_time(elapsed)}")
 
 
 async def progress_editor(msg, prog, render, interval=3.5):
@@ -232,10 +234,10 @@ def extract_surl(url: str):
 
 
 # =========================================================================
-# WRAPPER / HORT-LINK RESOLVER MODULE
+# WRAPPER / SHORT-LINK RESOLVER MODULE
 # Handles links like https://teraboxlinke.com/v/... that redirect (via
 # HTTP 30x, meta-refresh or JS) to the real TeraBox share page.
-# ========================================================================
+# =========================================================================
 WRAPPER_DOMAINS = (
     "teraboxlinke.com", "teraboxlink.com", "teraboxdownloader",
     "teraurl.com", "terabox.app/", "cybernewhub.com",
@@ -652,7 +654,7 @@ async def terabox_handler(event):
             label = f"**[{idx}/{len(files)}]** `{out_name}`"
             prog = Progress("Download", size, label)
             editor = asyncio.create_task(
-                progress_editor(status_msg, prog, render_progress_v2, 3.0))
+                progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
             def dlink_download():
                 u = TB.dlink(surl, fid)
@@ -667,7 +669,7 @@ async def terabox_handler(event):
                 await editor
                 prog = Progress("Stream", 100, label)
                 editor = asyncio.create_task(
-                    progress_editor(status_msg, prog, render_progress_v2, 3.0))
+                    progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
                 def status(a, b):
                     prog.update(int(a * 100 / b), 100)
@@ -681,7 +683,7 @@ async def terabox_handler(event):
             actual_size = os.path.getsize(path) if os.path.exists(path) else size
             prog = Progress("Upload", actual_size, label)
             editor = asyncio.create_task(
-                progress_editor(status_msg, prog, render_progress_v2, 3.0))
+                progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
             sent = await bot.send_file(
                 event.chat_id, path,
