@@ -281,7 +281,8 @@ async def expand_wrapper_url(url: str):
 class TeraBox:
     def __init__(self, ndus: str):
         self.s = requests.Session()
-        self.s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+        self.s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
+                               "Referer": BASE + "/"})
         for dom in (".1024tera.com", ".terabox.com"):
             self.s.cookies.set("ndus", ndus, domain=dom, path="/")
 
@@ -301,6 +302,44 @@ class TeraBox:
         if data.get("errno"):
             raise ValueError(f"Share info error (errno {data.get('errno')}).")
         return data
+
+    def dlink(self, surl: str, fid) -> str:
+        """Resolve the original full-file download URL (official web-app flow)."""
+        js = self._jstoken(surl)
+        info = self._share_info(surl, js)
+        data = self.s.get(f"{BASE}/share/download", params={
+            "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0",
+            "jsToken": js, "scene": "purchased_list", "product": "share",
+            "nozip": "0", "shareid": str(info["shareid"]), "sign": info["sign"],
+            "timestamp": str(info["timestamp"]), "uk": str(info["uk"]),
+            "primaryid": str(info["shareid"]),
+            "fid_list": json.dumps([str(fid)])}, timeout=30).json()
+        if data.get("errno") or not data.get("dlink"):
+            raise ValueError(
+                f"dlink unavailable (errno {data.get('errno')}) — "
+                "login cookie may be expired.")
+        return data["dlink"]
+
+    def download_full(self, url: str, dest: str, expect_size: int,
+                      status=None) -> int:
+        """Stream the original file in 1MB chunks; verify size before accept."""
+        written = 0
+        r = self.s.get(url, stream=True, timeout=(30, 300))
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    written += len(chunk)
+                    if status:
+                        status(written, expect_size)
+        if expect_size and abs(written - expect_size) > 1024:
+            if os.path.exists(dest):
+                os.remove(dest)
+            raise ValueError(
+                f"Size mismatch: got {human_readable_size(written)}, "
+                f"expected {human_readable_size(expect_size)}.")
+        return written
 
     def list_files(self, surl: str):
         out = []
@@ -534,14 +573,36 @@ async def terabox_handler(event):
                 f"📥 **Downloading [{idx}/{len(files)}]**\n\n"
                 f"📁 {out_name}\n"
                 f"📦 Size: {human_readable_size(size)}\n"
-                f"⏳ Fetching segments..."
+                f"🔐 Resolving original file link..."
             )
 
-            def status(a, b, idx=idx, name=out_name, size=size):
-                pct = round(a / b * 100)
-                logger.info(f"[{idx}] {name}: segment {a}/{b} ({pct}%)")
+            def dlink_download(idx=idx, name=out_name, size=size):
+                url = TB.dlink(surl, fid)
 
-            path = TB.download(surl, fid, out_name, status=status)
+                def prog(done, total):
+                    pct = round(done / total * 100) if total else 0
+                    logger.info(f"[{idx}] {name}: {human_readable_size(done)} ({pct}%)")
+
+                TB.download_full(url, out_name, size, status=prog)
+                return out_name
+
+            try:
+                loop = asyncio.get_event_loop()
+                path = await loop.run_in_executor(None, dlink_download)
+            except Exception as e:
+                logger.warning(f"Full-file download failed, HLS fallback: {e}")
+                await status_msg.edit(
+                    f"📥 **Downloading [{idx}/{len(files)}]**\n\n"
+                    f"📁 {out_name}\n"
+                    f"⚠️ Original link unavailable — stream fallback.\n"
+                    f"⏳ Fetching segments..."
+                )
+
+                def status(a, b, idx=idx, name=out_name, size=size):
+                    pct = round(a / b * 100)
+                    logger.info(f"[{idx}] {name}: segment {a}/{b} ({pct}%)")
+
+                path = TB.download(surl, fid, out_name, status=status)
 
             actual_size = os.path.getsize(path) if os.path.exists(path) else size
 
