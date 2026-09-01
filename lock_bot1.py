@@ -123,11 +123,16 @@ def human_readable_size(size_bytes):
 
 
 # =========================================================================
-# AUTO-DELETE + ANIMATED PROGRESS (variant 1: ▰▱ bar, speed/ETA/elapsed)
+# AUTO-DELETE + ANIMATED PROGRESS (variant 2: spinner + ■□ bar, completed/total, speed)
 # ========================================================================
-async def auto_delete(chat_id, message_ids, delay=AUTO_DELETE_SECONDS):
+async def auto_delete(chat_id, user_msg_id, bot_msg_id, delay=AUTO_DELETE_SECONDS):
     await asyncio.sleep(delay)
-    for mid in list(message_ids):
+    ids = [user_msg_id]
+    if isinstance(bot_msg_id, (list, tuple)):
+        ids.extend(bot_msg_id)
+    else:
+        ids.append(bot_msg_id)
+    for mid in ids:
         try:
             await bot.delete_messages(chat_id, [mid])
         except Exception:
@@ -167,15 +172,18 @@ def _bar(pct, full, empty, cells=10):
     return full * n + empty * (cells - n)
 
 
-def render_progress_v1(p):
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "…", "⠧", "⠇", "⠏")
+
+
+def render_progress_v2(p):
     done, total, pct, speed, eta, elapsed = p.snapshot()
-    icon = {"Download": "📥", "Upload": "📤", "Stream": "🎬"}.get(p.phase, "⏳")
+    spin = SPINNER_FRAMES[int(elapsed / 0.5) % len(SPINNER_FRAMES)]
     verb = {"Download": "Downloading", "Upload": "Uploading",
             "Stream": "Streaming"}.get(p.phase, p.phase)
-    return (f"{icon} **{verb}** {p.label}\n"
-            f"{_bar(pct, '▰', '♱')} **{pct}%**\n"
+    return (f"{spin} **{verb}** {p.label}\n"
+            f"{_bar(pct, '■', '□')} **{pct}%**\n"
             f"💾 {human_readable_size(done)} / {human_readable_size(total)}\n"
-            f"⚡ {speed / 1048576:.1f} MB/s • ⏳ ETA {_fmt_time(eta)} • 🕐 {_fmt_time(elapsed)}")
+            f"⚡ {speed / 1048576:.1f} MB/s")
 
 
 async def progress_editor(msg, prog, render, interval=3.5):
@@ -595,7 +603,7 @@ async def terabox_handler(event):
                 "Try sending the direct TeraBox link instead."
             )
             asyncio.create_task(auto_delete(
-                event.chat_id, [event.message.id, status_msg.id]))
+                event.chat_id, event.message.id, status_msg.id))
             return
         logger.info(f"Wrapper link resolved to: {resolved}")
         url = resolved
@@ -604,7 +612,7 @@ async def terabox_handler(event):
     if not surl:
         await status_msg.edit("⚠️ Couldn't find a share ID in the link. Please check the URL format.")
         asyncio.create_task(auto_delete(
-            event.chat_id, [event.message.id, status_msg.id]))
+            event.chat_id, event.message.id, status_msg.id))
         return
 
     try:
@@ -612,7 +620,7 @@ async def terabox_handler(event):
         if not files:
             await status_msg.edit("❌ No files found in this share link.")
             asyncio.create_task(auto_delete(
-                event.chat_id, [event.message.id, status_msg.id]))
+                event.chat_id, event.message.id, status_msg.id))
             return
 
         total_files = len(files)
@@ -644,7 +652,7 @@ async def terabox_handler(event):
             label = f"**[{idx}/{len(files)}]** `{out_name}`"
             prog = Progress("Download", size, label)
             editor = asyncio.create_task(
-                progress_editor(status_msg, prog, render_progress_v1, 3.5))
+                progress_editor(status_msg, prog, render_progress_v2, 3.0))
 
             def dlink_download():
                 u = TB.dlink(surl, fid)
@@ -659,7 +667,7 @@ async def terabox_handler(event):
                 await editor
                 prog = Progress("Stream", 100, label)
                 editor = asyncio.create_task(
-                    progress_editor(status_msg, prog, render_progress_v1, 3.5))
+                    progress_editor(status_msg, prog, render_progress_v2, 3.0))
 
                 def status(a, b):
                     prog.update(int(a * 100 / b), 100)
@@ -673,7 +681,7 @@ async def terabox_handler(event):
             actual_size = os.path.getsize(path) if os.path.exists(path) else size
             prog = Progress("Upload", actual_size, label)
             editor = asyncio.create_task(
-                progress_editor(status_msg, prog, render_progress_v1, 3.5))
+                progress_editor(status_msg, prog, render_progress_v2, 3.0))
 
             sent = await bot.send_file(
                 event.chat_id, path,
@@ -693,13 +701,13 @@ async def terabox_handler(event):
 
         await status_msg.edit("✅ **All files delivered successfully!**")
         asyncio.create_task(auto_delete(
-            event.chat_id, [event.message.id, status_msg.id] + sent_ids))
+            event.chat_id, event.message.id, [status_msg.id] + sent_ids))
 
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         await status_msg.edit(f"❌ **Error:** {str(e)[:200]}")
         asyncio.create_task(auto_delete(
-            event.chat_id, [event.message.id, status_msg.id]))
+            event.chat_id, event.message.id, status_msg.id))
 
 
 # =========================================================================
