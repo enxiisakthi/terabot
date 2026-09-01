@@ -43,6 +43,8 @@ AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
 DL_WORKERS = int(os.environ.get("DL_WORKERS", 8))
 DL_CHUNK_BYTES = 16 * 1024 * 1024
 MAX_BYTES = 2_000_000_000
+COOKIE_CHECK_SECONDS = int(os.environ.get("COOKIE_CHECK_SECONDS", 1800))
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", 851048597))
 
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
 
@@ -406,6 +408,16 @@ class TeraBox:
                 "login cookie may be expired.")
         return data["dlink"]
 
+    def alive(self):
+        """True=logged in, False=session dead, None=network/parse hiccup."""
+        try:
+            d = self.s.get(f"{DM}/api/check/login", timeout=30).json()
+        except Exception:
+            return None
+        if not isinstance(d, dict) or "errno" not in d:
+            return None
+        return d.get("errno") == 0
+
     def download_full(self, url: str, dest: str, expect_size: int,
                       status=None) -> int:
         """Multi-connection download; falls back to single stream on failure."""
@@ -731,6 +743,43 @@ async def cancel_handler(event):
 
 
 # =========================================================================
+# COOKIE EXPIRATION WATCHDOG
+# =========================================================================
+COOKIE_ALERT_TEXT = (
+    "⚠️ **TeraBox login expired**\n\n"
+    "The bot's TeraBox cookie no longer works, so downloads will fail or "
+    "crawl at free-tier speed.\n"
+    "Paste a fresh ndus cookie (Chrome → F12 → Application → Cookies) "
+    "to restore service.")
+
+_cookie_alerted = False
+
+
+async def _send_cookie_alert():
+    global _cookie_alerted
+    if _cookie_alerted:
+        return
+    _cookie_alerted = True
+    logger.warning("TeraBox cookie dead — alerting owner")
+    try:
+        await bot.send_message(OWNER_CHAT_ID, COOKIE_ALERT_TEXT)
+    except Exception as e:
+        logger.warning(f"Cookie alert send failed: {e}")
+
+
+async def cookie_watchdog():
+    global _cookie_alerted
+    loop = asyncio.get_event_loop()
+    while True:
+        ok = await loop.run_in_executor(None, TB.alive)
+        if ok is False:
+            await _send_cookie_alert()
+        elif ok is True:
+            _cookie_alerted = False
+        await asyncio.sleep(COOKIE_CHECK_SECONDS)
+
+
+# =========================================================================
 # MAIN TERABOX HANDLER
 # =========================================================================
 @bot.on(events.NewMessage)
@@ -935,6 +984,10 @@ async def terabox_handler(event):
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         await _stop_editor(prog, editor)
+        msg = str(e)
+        if ("cookie may be expired" in msg or "errno -6" in msg
+                or "400310" in msg):
+            asyncio.create_task(_send_cookie_alert())
         done_msg = await _finish_clean(
             event, status_msg, f"❌ **Error:** {str(e)[:200]}")
         asyncio.create_task(auto_delete(
@@ -954,6 +1007,8 @@ def main():
     logger.info(f"Auto-delete: {AUTO_DELETE_SECONDS}s")
     start_keepalive()
     bot.start(bot_token=BOT_TOKEN)
+    bot.loop.create_task(cookie_watchdog())
+    logger.info(f"Cookie watchdog started (every {COOKIE_CHECK_SECONDS}s)")
     logger.info("✅ Bot is running and listening for messages!")
     bot.run_until_disconnected()
 
