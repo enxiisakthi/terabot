@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urljoin
 from telethon import TelegramClient, events, Button
-from telethon.tl.types import ReplyInlineMarkup
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -411,8 +410,15 @@ class TeraBox:
                       status=None) -> int:
         """Multi-connection download; falls back to single stream on failure."""
         if expect_size:
+            t0 = time.time()
             try:
-                return self._download_parallel(url, dest, expect_size, status)
+                got = self._download_parallel(url, dest, expect_size, status)
+                dt = max(time.time() - t0, 0.001)
+                logger.info(
+                    f"Download route=parallel size={got/1e6:.1f}MB "
+                    f"time={dt:.1f}s speed={got/1e6/dt:.2f}MB/s "
+                    f"workers={DL_WORKERS}")
+                return got
             except JobCancelled:
                 if os.path.exists(dest):
                     os.remove(dest)
@@ -421,7 +427,13 @@ class TeraBox:
                 logger.warning(f"Parallel download failed, single-stream retry: {e}")
                 if os.path.exists(dest):
                     os.remove(dest)
-        return self._download_single(url, dest, expect_size, status)
+        t0 = time.time()
+        got = self._download_single(url, dest, expect_size, status)
+        dt = max(time.time() - t0, 0.001)
+        logger.info(
+            f"Download route=single size={got/1e6:.1f}MB "
+            f"time={dt:.1f}s speed={got/1e6/dt:.2f}MB/s")
+        return got
 
     @staticmethod
     def _verify_size(dest, written, expect_size):
@@ -438,7 +450,7 @@ class TeraBox:
         r = self.s.get(url, stream=True, timeout=(30, 300))
         r.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
+            for chunk in r.iter_content(256 * 1024):
                 if chunk:
                     f.write(chunk)
                     written += len(chunk)
@@ -477,7 +489,7 @@ class TeraBox:
                     r.raise_for_status()
                     with open(dest, "r+b") as f:
                         f.seek(start)
-                        for chunk in r.iter_content(512 * 1024):
+                        for chunk in r.iter_content(256 * 1024):
                             if chunk:
                                 f.write(chunk)
                                 with lock:
@@ -492,9 +504,15 @@ class TeraBox:
                         raise
                     time.sleep(2 ** attempt)
 
-        with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
-            for _ in ex.map(fetch, ranges):
-                pass
+        ex = ThreadPoolExecutor(max_workers=DL_WORKERS)
+        try:
+            futures = [ex.submit(fetch, rng) for rng in ranges]
+            for f in futures:
+                f.result()
+        except BaseException:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        ex.shutdown(wait=True)
         self._verify_size(dest, written, total)
         return written
 
@@ -653,18 +671,48 @@ class JobCancelled(Exception):
     """Raised inside download/upload loops when the user taps Cancel."""
 
 
-ACTIVE_JOBS = {}                      # job_id -> {"cancel": Event, "owner": id}
-NO_BUTTONS = ReplyInlineMarkup(rows=[])
+ACTIVE_JOBS = {}                      # job_id -> {"cancel","cancel_async","owner"}
+CANCEL_CLEANUP_SECONDS = 10           # how long a Cancelled notice stays
 
 
-async def _set_final(msg, text):
-    """Edit to a terminal state and drop the Cancel button (best-effort)."""
-    for kwargs in ({"buttons": NO_BUTTONS}, {}):
+async def _finish_clean(event, status_msg, text):
+    """Delete the buttoned status message and post a clean terminal message.
+
+    Telegram keeps an inline keyboard alive across text edits, so the only
+    reliable way to drop the Cancel button is to delete the message.
+    Returns the new message so callers can schedule its deletion.
+    """
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        return await event.respond(text)
+    except Exception:
+        return status_msg
+
+
+async def _stop_editor(prog, editor):
+    if editor is not None:
+        if prog is not None:
+            prog.finished = True
         try:
-            await msg.edit(text, **kwargs)
-            return
+            await editor
         except Exception:
-            continue
+            pass
+
+
+async def _await_cancellable(fut, cancel_async):
+    """Await an executor future but bail out the instant the user cancels."""
+    cancel_wait = asyncio.ensure_future(cancel_async.wait())
+    done, pending = await asyncio.wait({fut, cancel_wait},
+                                       return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
+    if cancel_wait in done:
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+        raise JobCancelled()
+    return fut.result()
 
 
 @bot.on(events.CallbackQuery(data=re.compile(rb"^cancel:-?\d+:\d+$")))
@@ -678,6 +726,7 @@ async def cancel_handler(event):
         await event.answer("This isn't your task.", alert=True)
         return
     job["cancel"].set()
+    job["cancel_async"].set()
     await event.answer("🛑 Cancelling…")
 
 
@@ -709,7 +758,9 @@ async def terabox_handler(event):
 
     job_id = f"{event.chat_id}:{event.message.id}"
     cancel_event = threading.Event()
-    ACTIVE_JOBS[job_id] = {"cancel": cancel_event, "owner": event.sender_id}
+    cancel_async = asyncio.Event()
+    ACTIVE_JOBS[job_id] = {"cancel": cancel_event, "cancel_async": cancel_async,
+                           "owner": event.sender_id}
     cancel_btn = [Button.inline("🛑 Cancel", data=f"cancel:{job_id}".encode())]
 
     status_msg = await event.respond(
@@ -721,12 +772,12 @@ async def terabox_handler(event):
         resolved = await expand_wrapper_url(url)
         if not resolved:
             ACTIVE_JOBS.pop(job_id, None)
-            await _set_final(status_msg,
+            done_msg = await _finish_clean(event, status_msg,
                 "❌ Couldn't resolve this shortened link.\n\n"
                 "It may be expired or unsupported.\n"
                 "Try sending the direct TeraBox link instead.")
             asyncio.create_task(auto_delete(
-                event.chat_id, event.message.id, status_msg.id))
+                event.chat_id, event.message.id, done_msg.id))
             return
         logger.info(f"Wrapper link resolved to: {resolved}")
         url = resolved
@@ -734,9 +785,11 @@ async def terabox_handler(event):
     surl = extract_surl(url)
     if not surl:
         ACTIVE_JOBS.pop(job_id, None)
-        await _set_final(status_msg, "⚠️ Couldn't find a share ID in the link. Please check the URL format.")
+        done_msg = await _finish_clean(
+            event, status_msg,
+            "⚠️ Couldn't find a share ID in the link. Please check the URL format.")
         asyncio.create_task(auto_delete(
-            event.chat_id, event.message.id, status_msg.id))
+            event.chat_id, event.message.id, done_msg.id))
         return
 
     prog = None
@@ -746,9 +799,10 @@ async def terabox_handler(event):
     try:
         files = TB.list_files(surl)
         if not files:
-            await _set_final(status_msg, "❌ No files found in this share link.")
+            done_msg = await _finish_clean(
+                event, status_msg, "❌ No files found in this share link.")
             asyncio.create_task(auto_delete(
-                event.chat_id, event.message.id, status_msg.id))
+                event.chat_id, event.message.id, done_msg.id))
             return
 
         total_files = len(files)
@@ -796,7 +850,8 @@ async def terabox_handler(event):
                 return out_name
 
             try:
-                path = await loop.run_in_executor(None, dlink_download)
+                path = await _await_cancellable(
+                    loop.run_in_executor(None, dlink_download), cancel_async)
             except JobCancelled:
                 raise
             except Exception as e:
@@ -812,8 +867,10 @@ async def terabox_handler(event):
                         raise JobCancelled()
                     prog.update(int(a * 100 / b), 100)
 
-                path = await loop.run_in_executor(
-                    None, lambda: TB.download(surl, fid, out_name, status=status))
+                path = await _await_cancellable(
+                    loop.run_in_executor(
+                        None, lambda: TB.download(surl, fid, out_name, status=status)),
+                    cancel_async)
 
             prog.finished = True
             await editor
@@ -855,33 +912,33 @@ async def terabox_handler(event):
             record_delivery(event.sender_id, user_name, out_name, actual_size)
             logger.info(f"Delivered: {out_name} ({human_readable_size(actual_size)})")
 
-        await _set_final(status_msg, "✅ **All files delivered successfully!**")
+        done_msg = await _finish_clean(
+            event, status_msg, "✅ **All files delivered successfully!**")
         asyncio.create_task(auto_delete(
-            event.chat_id, event.message.id, [status_msg.id] + sent_ids))
+            event.chat_id, event.message.id, [done_msg.id] + sent_ids))
 
     except JobCancelled:
         logger.info(f"Job cancelled by user: {job_id}")
-        if editor is not None:
-            prog.finished = True
-            try:
-                await editor
-            except Exception:
-                pass
+        await _stop_editor(prog, editor)
         if work_path and os.path.exists(work_path):
             try:
                 os.remove(work_path)
             except Exception:
                 pass
-        await _set_final(status_msg,
+        done_msg = await _finish_clean(
+            event, status_msg,
             "🚫 **Cancelled**\n\nYou stopped this download/upload.")
         asyncio.create_task(auto_delete(
-            event.chat_id, event.message.id, [status_msg.id] + sent_ids))
+            event.chat_id, event.message.id, [done_msg.id] + sent_ids,
+            delay=CANCEL_CLEANUP_SECONDS))
 
     except Exception as e:
         logger.error(f"Error occurred: {e}")
-        await _set_final(status_msg, f"❌ **Error:** {str(e)[:200]}")
+        await _stop_editor(prog, editor)
+        done_msg = await _finish_clean(
+            event, status_msg, f"❌ **Error:** {str(e)[:200]}")
         asyncio.create_task(auto_delete(
-            event.chat_id, event.message.id, status_msg.id))
+            event.chat_id, event.message.id, done_msg.id))
 
     finally:
         ACTIVE_JOBS.pop(job_id, None)
