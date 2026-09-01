@@ -13,7 +13,8 @@ from requests.adapters import HTTPAdapter
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urljoin
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import ReplyInlineMarkup
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -412,6 +413,10 @@ class TeraBox:
         if expect_size:
             try:
                 return self._download_parallel(url, dest, expect_size, status)
+            except JobCancelled:
+                if os.path.exists(dest):
+                    os.remove(dest)
+                raise
             except Exception as e:
                 logger.warning(f"Parallel download failed, single-stream retry: {e}")
                 if os.path.exists(dest):
@@ -480,6 +485,8 @@ class TeraBox:
                                     if status:
                                         status(written, total)
                     return
+                except JobCancelled:
+                    raise
                 except Exception:
                     if attempt == 3:
                         raise
@@ -640,6 +647,41 @@ async def stats_handler(event):
 
 
 # =========================================================================
+# CANCEL SUPPORT — inline 🛑 button aborts an in-flight download/upload
+# =========================================================================
+class JobCancelled(Exception):
+    """Raised inside download/upload loops when the user taps Cancel."""
+
+
+ACTIVE_JOBS = {}                      # job_id -> {"cancel": Event, "owner": id}
+NO_BUTTONS = ReplyInlineMarkup(rows=[])
+
+
+async def _set_final(msg, text):
+    """Edit to a terminal state and drop the Cancel button (best-effort)."""
+    for kwargs in ({"buttons": NO_BUTTONS}, {}):
+        try:
+            await msg.edit(text, **kwargs)
+            return
+        except Exception:
+            continue
+
+
+@bot.on(events.CallbackQuery(data=re.compile(rb"^cancel:-?\d+:\d+$")))
+async def cancel_handler(event):
+    job_id = event.data.decode()[len("cancel:"):]
+    job = ACTIVE_JOBS.get(job_id)
+    if job is None:
+        await event.answer("This task already finished.", alert=False)
+        return
+    if job.get("owner") and event.sender_id != job["owner"]:
+        await event.answer("This isn't your task.", alert=True)
+        return
+    job["cancel"].set()
+    await event.answer("🛑 Cancelling…")
+
+
+# =========================================================================
 # MAIN TERABOX HANDLER
 # =========================================================================
 @bot.on(events.NewMessage)
@@ -664,18 +706,25 @@ async def terabox_handler(event):
         return
 
     user_name = event.sender.first_name or "User"
-    status_msg = await event.respond("🔄 **Processing your link... Please wait...**")
+
+    job_id = f"{event.chat_id}:{event.message.id}"
+    cancel_event = threading.Event()
+    ACTIVE_JOBS[job_id] = {"cancel": cancel_event, "owner": event.sender_id}
+    cancel_btn = [Button.inline("🛑 Cancel", data=f"cancel:{job_id}".encode())]
+
+    status_msg = await event.respond(
+        "🔄 **Processing your link... Please wait...**", buttons=cancel_btn)
 
     # Resolve wrapper / shortened links to the real TeraBox share URL
     if is_wrapper_link(url):
         await status_msg.edit("🔗 **Resolving shortened link...**\n\n⏳ Following redirects...")
         resolved = await expand_wrapper_url(url)
         if not resolved:
-            await status_msg.edit(
+            ACTIVE_JOBS.pop(job_id, None)
+            await _set_final(status_msg,
                 "❌ Couldn't resolve this shortened link.\n\n"
                 "It may be expired or unsupported.\n"
-                "Try sending the direct TeraBox link instead."
-            )
+                "Try sending the direct TeraBox link instead.")
             asyncio.create_task(auto_delete(
                 event.chat_id, event.message.id, status_msg.id))
             return
@@ -684,15 +733,20 @@ async def terabox_handler(event):
 
     surl = extract_surl(url)
     if not surl:
-        await status_msg.edit("⚠️ Couldn't find a share ID in the link. Please check the URL format.")
+        ACTIVE_JOBS.pop(job_id, None)
+        await _set_final(status_msg, "⚠️ Couldn't find a share ID in the link. Please check the URL format.")
         asyncio.create_task(auto_delete(
             event.chat_id, event.message.id, status_msg.id))
         return
 
+    prog = None
+    editor = None
+    work_path = None
+    sent_ids = []
     try:
         files = TB.list_files(surl)
         if not files:
-            await status_msg.edit("❌ No files found in this share link.")
+            await _set_final(status_msg, "❌ No files found in this share link.")
             asyncio.create_task(auto_delete(
                 event.chat_id, event.message.id, status_msg.id))
             return
@@ -708,9 +762,11 @@ async def terabox_handler(event):
             files = files[:MAX_FILES]
 
         loop = asyncio.get_event_loop()
-        sent_ids = []
 
         for idx, (fid, name, size) in enumerate(files, 1):
+            if cancel_event.is_set():
+                raise JobCancelled()
+
             out_name = clean_name(name)
             if not out_name.lower().endswith((".mp4", ".ts", ".mkv", ".avi", ".mov")):
                 out_name += ".mp4"
@@ -723,18 +779,26 @@ async def terabox_handler(event):
                 sent_ids.append(skip.id)
                 continue
 
+            work_path = out_name
             label = f"**[{idx}/{len(files)}]** `{out_name}`"
             prog = Progress("Download", size, label)
             editor = asyncio.create_task(
                 progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
+            def dl_status(written, total):
+                if cancel_event.is_set():
+                    raise JobCancelled()
+                prog.update(written, total)
+
             def dlink_download():
                 u = TB.dlink(surl, fid)
-                TB.download_full(u, out_name, size, status=prog.update)
+                TB.download_full(u, out_name, size, status=dl_status)
                 return out_name
 
             try:
                 path = await loop.run_in_executor(None, dlink_download)
+            except JobCancelled:
+                raise
             except Exception as e:
                 logger.warning(f"Full-file download failed, HLS fallback: {e}")
                 prog.finished = True
@@ -744,6 +808,8 @@ async def terabox_handler(event):
                     progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
                 def status(a, b):
+                    if cancel_event.is_set():
+                        raise JobCancelled()
                     prog.update(int(a * 100 / b), 100)
 
                 path = await loop.run_in_executor(
@@ -752,15 +818,27 @@ async def terabox_handler(event):
             prog.finished = True
             await editor
 
+            if cancel_event.is_set():
+                raise JobCancelled()
+
             actual_size = os.path.getsize(path) if os.path.exists(path) else size
             prog = Progress("Upload", actual_size, label)
             editor = asyncio.create_task(
                 progress_editor(status_msg, prog, render_progress_dual, 3.0))
 
+            def up_status(current, total):
+                if cancel_event.is_set():
+                    raise JobCancelled()
+                prog.update(current, total)
+
             with open(path, "rb") as fh:
                 uploaded = await bot.upload_file(
                     fh, file_name=out_name, part_size_kb=512,
-                    progress_callback=prog.update)
+                    progress_callback=up_status)
+
+            if cancel_event.is_set():
+                raise JobCancelled()
+
             sent = await bot.send_file(
                 event.chat_id, uploaded,
                 caption=f"🎬 **TeraBox Video** ({idx}/{len(files)})\n\n"
@@ -772,19 +850,41 @@ async def terabox_handler(event):
             await editor
             sent_ids.append(sent.id)
             os.remove(path)
+            work_path = None
 
             record_delivery(event.sender_id, user_name, out_name, actual_size)
             logger.info(f"Delivered: {out_name} ({human_readable_size(actual_size)})")
 
-        await status_msg.edit("✅ **All files delivered successfully!**")
+        await _set_final(status_msg, "✅ **All files delivered successfully!**")
+        asyncio.create_task(auto_delete(
+            event.chat_id, event.message.id, [status_msg.id] + sent_ids))
+
+    except JobCancelled:
+        logger.info(f"Job cancelled by user: {job_id}")
+        if editor is not None:
+            prog.finished = True
+            try:
+                await editor
+            except Exception:
+                pass
+        if work_path and os.path.exists(work_path):
+            try:
+                os.remove(work_path)
+            except Exception:
+                pass
+        await _set_final(status_msg,
+            "🚫 **Cancelled**\n\nYou stopped this download/upload.")
         asyncio.create_task(auto_delete(
             event.chat_id, event.message.id, [status_msg.id] + sent_ids))
 
     except Exception as e:
         logger.error(f"Error occurred: {e}")
-        await status_msg.edit(f"❌ **Error:** {str(e)[:200]}")
+        await _set_final(status_msg, f"❌ **Error:** {str(e)[:200]}")
         asyncio.create_task(auto_delete(
             event.chat_id, event.message.id, status_msg.id))
+
+    finally:
+        ACTIVE_JOBS.pop(job_id, None)
 
 
 # =========================================================================
