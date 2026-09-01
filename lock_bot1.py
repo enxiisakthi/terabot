@@ -30,6 +30,7 @@ API_HASH = os.environ.get("API_HASH", "414c5699e4129ee3bd3aa9fe800d35ee")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8857970216:AAG1e35bYykHU3sQwMcagpYcyhRAT-vD6lQ")
 
 BASE = "https://www.1024tera.com"
+DM = "https://dm.1024terabox.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -282,8 +283,9 @@ class TeraBox:
     def __init__(self, ndus: str):
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
-                               "Referer": BASE + "/"})
-        for dom in (".1024tera.com", ".terabox.com"):
+                               "Referer": BASE + "/",
+                               "X-Requested-With": "XMLHttpRequest"})
+        for dom in (".1024tera.com", ".terabox.com", ".1024terabox.com"):
             self.s.cookies.set("ndus", ndus, domain=dom, path="/")
 
     def _jstoken(self, surl: str) -> str:
@@ -307,10 +309,11 @@ class TeraBox:
         """Resolve the original full-file download URL (official web-app flow)."""
         js = self._jstoken(surl)
         info = self._share_info(surl, js)
-        data = self.s.get(f"{BASE}/share/download", params={
+        data = self.s.get(f"{DM}/share/download", params={
             "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0",
             "jsToken": js, "scene": "purchased_list", "product": "share",
-            "nozip": "0", "shareid": str(info["shareid"]), "sign": info["sign"],
+            "nozip": "0", "root": "1", "shareid": str(info["shareid"]),
+            "sign": info["sign"],
             "timestamp": str(info["timestamp"]), "uk": str(info["uk"]),
             "primaryid": str(info["shareid"]),
             "fid_list": json.dumps([str(fid)])}, timeout=30).json()
