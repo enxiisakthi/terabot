@@ -8,7 +8,6 @@ import logging
 import threading
 import subprocess
 import requests
-from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -41,7 +40,6 @@ SELF_URL = os.environ.get("SELF_URL", "https://terabot-uuii.onrender.com")
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 300))
 AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
 DL_WORKERS = int(os.environ.get("DL_WORKERS", 8))
-DL_CHUNK_BYTES = 16 * 1024 * 1024
 MAX_BYTES = 2_000_000_000
 COOKIE_CHECK_SECONDS = int(os.environ.get("COOKIE_CHECK_SECONDS", 1800))
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", 851048597))
@@ -372,9 +370,13 @@ class TeraBox:
                               pool_maxsize=DL_WORKERS + 2)
         self.s.mount("https://", adapter)
         self.s.mount("http://", adapter)
+        self.g = requests.Session()
+        self.g.headers.update(self.s.headers)
+        self.g.mount("https://", adapter)
+        self.g.mount("http://", adapter)
 
     def _jstoken(self, surl: str) -> str:
-        html = self.s.get(
+        html = self.g.get(
             f"{BASE}/wap/share/filelist?surl={surl}&clearCache=1", timeout=60).text
         m = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', html)
         if not m:
@@ -382,7 +384,7 @@ class TeraBox:
         return m.group(1)
 
     def _share_info(self, surl: str, js: str) -> dict:
-        data = self.s.get(f"{BASE}/api/shorturlinfo", params={
+        data = self.g.get(f"{BASE}/api/shorturlinfo", params={
             "app_id": "250528", "shorturl": "1" + surl, "root": "1", "web": "1",
             "channel": "dubox", "clienttype": "0", "jsToken": js,
             "t": str(int(time.time()))}, timeout=30).json()
@@ -394,19 +396,26 @@ class TeraBox:
         """Resolve the original full-file download URL (official web-app flow)."""
         js = self._jstoken(surl)
         info = self._share_info(surl, js)
-        data = self.s.get(f"{DM}/share/download", params={
+        params = {
             "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0",
             "jsToken": js, "scene": "purchased_list", "product": "share",
             "nozip": "0", "root": "1", "shareid": str(info["shareid"]),
             "sign": info["sign"],
             "timestamp": str(info["timestamp"]), "uk": str(info["uk"]),
             "primaryid": str(info["shareid"]),
-            "fid_list": json.dumps([str(fid)])}, timeout=30).json()
-        if data.get("errno") or not data.get("dlink"):
-            raise ValueError(
-                f"dlink unavailable (errno {data.get('errno')}) — "
-                "login cookie may be expired.")
-        return data["dlink"]
+            "fid_list": json.dumps([str(fid)])}
+        last_errno = None
+        for sess in (self.s, self.g):
+            data = sess.get(f"{DM}/share/download", params=params,
+                            timeout=30).json()
+            last_errno = data.get("errno")
+            if not last_errno and data.get("dlink"):
+                return data["dlink"]
+            if last_errno not in (-6, 400310):
+                break
+        raise ValueError(
+            f"dlink unavailable (errno {last_errno}) — "
+            "login cookie may be expired.")
 
     def alive(self):
         """True=logged in, False=session dead, None=network/parse hiccup."""
@@ -420,30 +429,12 @@ class TeraBox:
 
     def download_full(self, url: str, dest: str, expect_size: int,
                       status=None) -> int:
-        """Multi-connection download; falls back to single stream on failure."""
-        if expect_size:
-            t0 = time.time()
-            try:
-                got = self._download_parallel(url, dest, expect_size, status)
-                dt = max(time.time() - t0, 0.001)
-                logger.info(
-                    f"Download route=parallel size={got/1e6:.1f}MB "
-                    f"time={dt:.1f}s speed={got/1e6/dt:.2f}MB/s "
-                    f"workers={DL_WORKERS}")
-                return got
-            except JobCancelled:
-                if os.path.exists(dest):
-                    os.remove(dest)
-                raise
-            except Exception as e:
-                logger.warning(f"Parallel download failed, single-stream retry: {e}")
-                if os.path.exists(dest):
-                    os.remove(dest)
+        """Single-stream download with progress reporting."""
         t0 = time.time()
         got = self._download_single(url, dest, expect_size, status)
         dt = max(time.time() - t0, 0.001)
         logger.info(
-            f"Download route=single size={got/1e6:.1f}MB "
+            f"Download size={got/1e6:.1f}MB "
             f"time={dt:.1f}s speed={got/1e6/dt:.2f}MB/s")
         return got
 
@@ -469,63 +460,6 @@ class TeraBox:
                     if status:
                         status(written, expect_size)
         self._verify_size(dest, written, expect_size)
-        return written
-
-    def _download_parallel(self, url: str, dest: str, total: int,
-                           status=None) -> int:
-        probe = self.s.get(url, headers={"Range": "bytes=0-0"},
-                           stream=True, timeout=(30, 60))
-        try:
-            if probe.status_code != 206:
-                raise ValueError(
-                    f"range requests unsupported (HTTP {probe.status_code})")
-        finally:
-            probe.close()
-
-        with open(dest, "wb") as f:
-            f.truncate(total)
-
-        ranges = [(s, min(s + DL_CHUNK_BYTES, total) - 1)
-                  for s in range(0, total, DL_CHUNK_BYTES)]
-        written = 0
-        lock = threading.Lock()
-
-        def fetch(rng):
-            nonlocal written
-            start, end = rng
-            headers = {"Range": f"bytes={start}-{end}"}
-            for attempt in range(4):
-                try:
-                    r = self.s.get(url, headers=headers, stream=True,
-                                   timeout=(30, 120))
-                    r.raise_for_status()
-                    with open(dest, "r+b") as f:
-                        f.seek(start)
-                        for chunk in r.iter_content(256 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                                with lock:
-                                    written += len(chunk)
-                                    if status:
-                                        status(written, total)
-                    return
-                except JobCancelled:
-                    raise
-                except Exception:
-                    if attempt == 3:
-                        raise
-                    time.sleep(2 ** attempt)
-
-        ex = ThreadPoolExecutor(max_workers=DL_WORKERS)
-        try:
-            futures = [ex.submit(fetch, rng) for rng in ranges]
-            for f in futures:
-                f.result()
-        except BaseException:
-            ex.shutdown(wait=False, cancel_futures=True)
-            raise
-        ex.shutdown(wait=True)
-        self._verify_size(dest, written, total)
         return written
 
     def list_files(self, surl: str):
@@ -986,7 +920,7 @@ async def terabox_handler(event):
         await _stop_editor(prog, editor)
         msg = str(e)
         if ("cookie may be expired" in msg or "errno -6" in msg
-                or "400310" in msg):
+                or "400310" in msg or "redirects" in msg):
             asyncio.create_task(_send_cookie_alert())
         done_msg = await _finish_clean(
             event, status_msg, f"❌ **Error:** {str(e)[:200]}")
