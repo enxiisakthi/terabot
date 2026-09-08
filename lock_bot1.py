@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import re
 import time
 import requests
@@ -26,6 +27,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CAPSOLVER_KEY = os.getenv("CAPSOLVER_KEY")
 
 SITE_URL = os.getenv("SITE_URL", "https://www.terabox.com/")
+COOKIE_JSON = os.getenv("COOKIE_JSON")
+TERABOX_BASE = "https://www.1024tera.com"
 
 CAPSOLVER_API = "https://api.capsolver.com/createTask"
 CAPSOLVER_RESULT = "https://api.capsolver.com/getTaskResult"
@@ -94,6 +97,85 @@ def is_supported_terabox_url(value):
     return parsed.scheme in {"http", "https"} and bool(host) and any(
         host == domain or host.endswith(f".{domain}") for domain in SUPPORTED_HOSTS
     )
+
+
+def extract_share_id(value):
+    """Extract the share token used by TeraBox's web download endpoints."""
+    match = re.search(r"/s/1([A-Za-z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]surl=1?([A-Za-z0-9_-]+)", value)
+    return match.group(1) if match else None
+
+
+class TeraBoxDirectDownload:
+    """Fetch the original via TeraBox's web endpoint, not a simulated UI click."""
+
+    def __init__(self, ndus):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{TERABOX_BASE}/",
+        })
+        for domain in (".1024tera.com", ".terabox.com"):
+            self.session.cookies.set("ndus", ndus, domain=domain, path="/")
+
+    def _js_token(self, share_id):
+        response = self.session.get(f"{TERABOX_BASE}/wap/share/filelist", params={"surl": share_id, "clearCache": "1"}, timeout=60)
+        response.raise_for_status()
+        match = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', response.text)
+        if not match:
+            raise RuntimeError("TeraBox did not return a download session token.")
+        return match.group(1)
+
+    def _share_info(self, share_id, js_token):
+        response = self.session.get(f"{TERABOX_BASE}/api/shorturlinfo", params={
+            "app_id": "250528", "shorturl": f"1{share_id}", "root": "1", "web": "1",
+            "channel": "dubox", "clienttype": "0", "jsToken": js_token, "t": str(int(time.time())),
+        }, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("errno"):
+            raise RuntimeError(f"TeraBox share lookup failed (code {data['errno']}).")
+        return data
+
+    def first_file(self, share_id):
+        response = self.session.get("https://www.terabox.com/share/list", params={
+            "app_id": "250528", "web": "1", "channel": "10", "shorturl": share_id, "root": "1",
+        }, timeout=60)
+        response.raise_for_status()
+        files = [item for item in response.json().get("list", []) if str(item.get("isdir")) != "1"]
+        if not files:
+            raise RuntimeError("No downloadable file was found in this TeraBox share.")
+        video_extensions = (".mp4", ".mkv", ".mov", ".avi", ".webm")
+        return next((item for item in files if item.get("server_filename", "").lower().endswith(video_extensions)), files[0])
+
+    def download_original(self, share_id, file_id, expected_size, output_path):
+        js_token = self._js_token(share_id)
+        info = self._share_info(share_id, js_token)
+        response = self.session.get(f"{TERABOX_BASE}/share/download", params={
+            "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0", "jsToken": js_token,
+            "scene": "purchased_list", "product": "share", "nozip": "0", "shareid": str(info["shareid"]),
+            "sign": info["sign"], "timestamp": str(info["timestamp"]), "uk": str(info["uk"]),
+            "primaryid": str(info["shareid"]), "fid_list": json.dumps([str(file_id)]),
+        }, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        dlink = data.get("dlink")
+        if data.get("errno") or not dlink:
+            raise RuntimeError("TeraBox refused the original-file link; COOKIE_JSON may be expired.")
+        written = 0
+        with self.session.get(dlink, stream=True, timeout=(60, 600)) as source:
+            source.raise_for_status()
+            with open(output_path, "wb") as output:
+                for chunk in source.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+                        written += len(chunk)
+        if expected_size and abs(written - expected_size) > 1024:
+            raise FullVideoVerificationError(f"TeraBox returned {written} bytes, but the original is {expected_size} bytes.")
+        return written
 
 
 async def source_video_duration(page):
@@ -176,80 +258,27 @@ def find_sitekey(page_content):
 
 
 async def download_full_terabox_video(link, progress_cb, output_path):
-    await progress_cb("Preparing browser...")
-    await ensure_chromium_installed()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+    if not COOKIE_JSON:
+        return False, "COOKIE_JSON is not configured on Render."
+    share_id = extract_share_id(link)
+    if not share_id:
+        return False, "Couldn't read the TeraBox share ID from this link."
+    try:
+        await progress_cb("Resolving the original video...")
+        client = TeraBoxDirectDownload(COOKIE_JSON)
+        file_info = await asyncio.to_thread(client.first_file, share_id)
+        expected_size = int(file_info.get("size") or 0)
+        await progress_cb("Downloading the original full video...")
+        await asyncio.to_thread(
+            client.download_original,
+            share_id,
+            file_info["fs_id"],
+            expected_size,
+            output_path,
         )
-        context = None
-        try:
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}, accept_downloads=True, locale="en-US",
-            )
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-            """)
-            page = await context.new_page()
-            await progress_cb("Opening TeraBox link...")
-            await page.goto(link, timeout=90000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
-            if not is_supported_terabox_url(page.url):
-                return False, "The link redirected outside supported TeraBox domains."
-
-            for _ in range(3):
-                content = await page.content()
-                if "moment" not in (await page.title()).lower() and "challenge" not in content.lower():
-                    break
-                site_key = find_sitekey(content)
-                if not site_key:
-                    await progress_cb("Waiting for the TeraBox page...")
-                    await page.wait_for_timeout(3000)
-                    continue
-                if not CAPSOLVER_KEY:
-                    return False, "TeraBox requires verification, but CAPSOLVER_KEY is not configured."
-                await progress_cb("Completing TeraBox verification...")
-                token = await asyncio.to_thread(solve_turnstile, page.url, site_key)
-                await page.evaluate("""(token) => {
-                    const el = document.querySelector('[name="cf-turnstile-response"]');
-                    if (el) { el.value = token; el.dispatchEvent(new Event('input', {bubbles:true})); }
-                    const forms = document.querySelectorAll('form');
-                    forms.forEach(f => { if (f.checkValidity) f.requestSubmit(); });
-                }""", token)
-                await page.wait_for_timeout(5000)
-
-            await progress_cb("Reading full-video duration...")
-            expected_duration = await source_video_duration(page)
-            if expected_duration is None:
-                return False, "Couldn't verify the source video's duration, so no file was sent."
-            await progress_cb("Requesting the verified full video (this can take a moment)...")
-            download_button = page.get_by_role("button", name=re.compile(r"^Download$", re.I))
-            if await download_button.count() == 0:
-                download_button = page.get_by_role("link", name=re.compile(r"^Download$", re.I))
-            if await download_button.count() == 0 or not await download_button.first.is_visible():
-                return False, "The full-video Download button was not available."
-            # Large original files can take longer than a minute before TeraBox
-            # begins the browser download.
-            async with page.expect_download(timeout=180000) as download_info:
-                await download_button.first.click()
-            download = await download_info.value
-            await download.save_as(output_path)
-            await progress_cb("Verifying downloaded video length...")
-            await asyncio.to_thread(verify_full_video, output_path, expected_duration)
-            return True, "Success"
-        except FullVideoVerificationError as error:
-            return False, str(error)
-        finally:
-            if context:
-                await context.close()
-            await browser.close()
+        return True, "Success"
+    except (requests.RequestException, ValueError, KeyError, FullVideoVerificationError, RuntimeError) as error:
+        return False, str(error)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
