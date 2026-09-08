@@ -6,6 +6,8 @@ import requests
 import tempfile
 import subprocess
 from urllib.parse import urlsplit
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import imageio_ffmpeg
 from telegram import Update
@@ -44,6 +46,27 @@ SUPPORTED_HOSTS = (
 
 class FullVideoVerificationError(RuntimeError):
     """Raised when TeraBox returns a preview instead of the selected video."""
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Minimal endpoint required by Render Web Service port detection."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = os.getenv("PORT")
+    if not port:
+        return
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthCheckHandler)
+    Thread(target=server.serve_forever, daemon=True, name="health-server").start()
 
 
 def is_supported_terabox_url(value):
@@ -268,6 +291,8 @@ def main():
     if not BOT_TOKEN:
         print("Set BOT_TOKEN environment variable")
         return
+
+    start_health_server()
 
     # Python 3.14 no longer creates a default event loop in the main thread.
     # python-telegram-bot's synchronous run_polling() API still requires one.
