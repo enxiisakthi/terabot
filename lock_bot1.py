@@ -5,6 +5,8 @@ import time
 import requests
 import tempfile
 import subprocess
+import sys
+from pathlib import Path
 from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -67,6 +69,22 @@ def start_health_server():
         return
     server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthCheckHandler)
     Thread(target=server.serve_forever, daemon=True, name="health-server").start()
+
+
+async def ensure_chromium_installed():
+    """Install Playwright's bundled Chromium if the deployment image lacks it."""
+    async with async_playwright() as p:
+        chromium_path = Path(p.chromium.executable_path)
+    if chromium_path.is_file():
+        return
+
+    print("Playwright Chromium is missing; installing it now...")
+    await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        timeout=600,
+    )
 
 
 def is_supported_terabox_url(value):
@@ -293,6 +311,12 @@ def main():
         return
 
     start_health_server()
+
+    try:
+        asyncio.run(ensure_chromium_installed())
+    except (subprocess.SubprocessError, OSError) as error:
+        print(f"Could not install Playwright Chromium: {error}")
+        return
 
     # Python 3.14 no longer creates a default event loop in the main thread.
     # python-telegram-bot's synchronous run_polling() API still requires one.
