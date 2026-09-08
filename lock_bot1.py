@@ -235,11 +235,9 @@ async def download_full_terabox_video(link, progress_cb, output_path):
                 download_button = page.get_by_role("link", name=re.compile(r"^Download$", re.I))
             if await download_button.count() == 0 or not await download_button.first.is_visible():
                 return False, "The full-video Download button was not available."
-            # TeraBox sometimes starts the transfer from a popup/redirect rather
-            # than the page that was clicked.  Listen on the whole browser
-            # context so either route is captured, and allow the remote service
-            # sufficient time to prepare a large original file.
-            async with context.expect_event("download", timeout=180000) as download_info:
+            # Large original files can take longer than a minute before TeraBox
+            # begins the browser download.
+            async with page.expect_download(timeout=180000) as download_info:
                 await download_button.first.click()
             download = await download_info.value
             await download.save_as(output_path)
