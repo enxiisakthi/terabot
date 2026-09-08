@@ -1,0 +1,14 @@
+services:
+  - type: web
+    runtime: python
+    name: terabot
+    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    startCommand: python lock_bot1.py
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CAPSOLVER_KEY
+        sync: false
+      - key: SITE_URL
+        value: https://www.terabox.com/
