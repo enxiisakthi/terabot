@@ -269,6 +269,13 @@ def main():
         print("Set BOT_TOKEN environment variable")
         return
 
+    # Python 3.14 no longer creates a default event loop in the main thread.
+    # python-telegram-bot's synchronous run_polling() API still requires one.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
