@@ -176,6 +176,8 @@ def find_sitekey(page_content):
 
 
 async def download_full_terabox_video(link, progress_cb, output_path):
+    await progress_cb("Preparing browser...")
+    await ensure_chromium_installed()
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -311,12 +313,6 @@ def main():
         return
 
     start_health_server()
-
-    try:
-        asyncio.run(ensure_chromium_installed())
-    except (subprocess.SubprocessError, OSError) as error:
-        print(f"Could not install Playwright Chromium: {error}")
-        return
 
     # Python 3.14 no longer creates a default event loop in the main thread.
     # python-telegram-bot's synchronous run_polling() API still requires one.
