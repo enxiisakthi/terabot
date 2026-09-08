@@ -27,7 +27,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CAPSOLVER_KEY = os.getenv("CAPSOLVER_KEY")
 
 SITE_URL = os.getenv("SITE_URL", "https://www.terabox.com/")
-COOKIE_JSON = os.getenv("COOKIE_JSON")
+# Older deployments use TERABOX_COOKIE; accept both names during migration.
+COOKIE_JSON = os.getenv("COOKIE_JSON") or os.getenv("TERABOX_COOKIE")
 TERABOX_BASE = "https://www.1024tera.com"
 
 CAPSOLVER_API = "https://api.capsolver.com/createTask"
