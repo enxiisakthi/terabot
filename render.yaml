@@ -10,5 +10,7 @@ services:
         sync: false
       - key: CAPSOLVER_KEY
         sync: false
+      - key: COOKIE_JSON
+        sync: false
       - key: SITE_URL
         value: https://www.terabox.com/
