@@ -54,6 +54,24 @@ class FullVideoVerificationError(RuntimeError):
     """Raised when TeraBox returns a preview instead of the selected video."""
 
 
+def extract_ndus(cookie_value):
+    """Accept a raw ndus token, a Cookie header, or exported cookie JSON."""
+    value = (cookie_value or "").strip()
+    if not value:
+        return None
+    if value.startswith("{") or value.startswith("["):
+        try:
+            data = json.loads(value)
+            cookies = data.get("cookies", data) if isinstance(data, dict) else data
+            for cookie in cookies:
+                if isinstance(cookie, dict) and cookie.get("name") == "ndus":
+                    return str(cookie.get("value") or "").strip() or None
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"(?:^|[;\s])ndus=([^;\s]+)", value, flags=re.IGNORECASE)
+    return match.group(1) if match else value
+
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Minimal endpoint required by Render Web Service port detection."""
 
@@ -112,7 +130,10 @@ def extract_share_id(value):
 class TeraBoxDirectDownload:
     """Fetch the original via TeraBox's web endpoint, not a simulated UI click."""
 
-    def __init__(self, ndus):
+    def __init__(self, cookie_value):
+        ndus = extract_ndus(cookie_value)
+        if not ndus:
+            raise RuntimeError("No ndus cookie was supplied.")
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
@@ -165,7 +186,12 @@ class TeraBoxDirectDownload:
         data = response.json()
         dlink = data.get("dlink")
         if data.get("errno") or not dlink:
-            raise RuntimeError("TeraBox refused the original-file link; COOKIE_JSON may be expired.")
+            code = data.get("errno", "missing dlink")
+            detail = data.get("errmsg") or data.get("message") or "no additional detail"
+            raise RuntimeError(
+                f"TeraBox refused the original-file link (code {code}: {detail}). "
+                "Sign in to TeraBox and update TERABOX_COOKIE with a fresh ndus cookie."
+            )
         written = 0
         with self.session.get(dlink, stream=True, timeout=(60, 600)) as source:
             source.raise_for_status()
@@ -264,6 +290,7 @@ async def download_full_terabox_video(link, progress_cb, output_path):
     share_id = extract_share_id(link)
     if not share_id:
         return False, "Couldn't read the TeraBox share ID from this link."
+    original_error = None
     try:
         await progress_cb("Resolving the original video...")
         client = TeraBoxDirectDownload(COOKIE_JSON)
@@ -279,7 +306,51 @@ async def download_full_terabox_video(link, progress_cb, output_path):
         )
         return True, "Success"
     except (requests.RequestException, ValueError, KeyError, FullVideoVerificationError, RuntimeError) as error:
-        return False, str(error)
+        print(f"TeraBox download failed for share {share_id}: {error}")
+        original_error = str(error)
+
+    # Some public shares do not authorize the original-file endpoint.  Fall
+    # back to the public player stream, and label it honestly as a preview.
+    try:
+        await progress_cb("Original unavailable; trying the TeraBox preview stream...")
+        written = await download_terabox_preview(link, output_path)
+        if written <= 1000:
+            raise FullVideoVerificationError("The TeraBox preview stream was empty.")
+        return True, "Preview"
+    except (requests.RequestException, ValueError, FullVideoVerificationError, RuntimeError) as preview_error:
+        return False, f"Original: {original_error}. Preview: {preview_error}"
+
+
+async def download_terabox_preview(link, output_path):
+    """Download the public player's direct media stream without bypassing login or challenges."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(link, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_selector("video", timeout=30000)
+            sources = await page.locator("video").evaluate_all(
+                "videos => videos.map(video => video.currentSrc || video.src).filter(Boolean)"
+            )
+            source_url = next((url for url in sources if url.startswith(("http://", "https://"))), None)
+            if not source_url:
+                raise RuntimeError("TeraBox did not expose a downloadable public preview stream.")
+            cookies = {cookie["name"]: cookie["value"] for cookie in await context.cookies()}
+        finally:
+            await browser.close()
+
+    written = 0
+    with requests.get(source_url, headers={"Referer": link}, cookies=cookies, stream=True, timeout=(60, 600)) as source:
+        source.raise_for_status()
+        with open(output_path, "wb") as output:
+            for chunk in source.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+                    written += len(chunk)
+    return written
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,13 +376,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.close(file_descriptor)
 
     try:
-        success, err = await download_full_terabox_video(text, progress, tmp_path)
+        success, result = await download_full_terabox_video(text, progress, tmp_path)
     except Exception as e:
         await progress(f"Browser error: {str(e)[:200]}")
         return
 
     if not success:
-        await progress(f"Couldn't deliver a verified full video: {err}")
+        await progress(f"Couldn't deliver a TeraBox video: {result}")
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -320,13 +391,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await progress("Sending full video...")
+        await progress("Sending preview video..." if result == "Preview" else "Sending full video...")
         file_size = os.path.getsize(tmp_path)
         with open(tmp_path, "rb") as video_file:
             await update.message.reply_video(
                 video=video_file,
                 filename="TeraBox_Full_Video.mp4",
-                caption=f"Here's your full TeraBox video ({file_size // 1024} KB)"
+                caption=(f"Here's your TeraBox {'preview' if result == 'Preview' else 'full'} video "
+                         f"({file_size // 1024} KB)")
             )
         await status.delete()
     except Exception as e:
