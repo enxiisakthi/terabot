@@ -2,7 +2,7 @@ services:
   - type: web
     runtime: python
     name: terabot
-    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps --only-shell
     startCommand: python lock_bot1.py
     healthCheckPath: /
     envVars:
